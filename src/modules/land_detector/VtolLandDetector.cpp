@@ -46,39 +46,44 @@
 namespace land_detector
 {
 
-VtolLandDetector::VtolLandDetector() : MulticopterLandDetector(),
-	_paramHandle(),
-	_params(),
-	_airspeedSub(-1),
-	_airspeed{},
-	_was_in_air(false),
-	_airspeed_filtered(0)
+VtolLandDetector::VtolLandDetector()
 {
 	_paramHandle.maxAirSpeed = param_find("LNDFW_AIRSPD_MAX");
-}
-
-void VtolLandDetector::_initialize_topics()
-{
-	MulticopterLandDetector::_initialize_topics();
-
-	_airspeedSub = orb_subscribe(ORB_ID(airspeed));
 }
 
 void VtolLandDetector::_update_topics()
 {
 	MulticopterLandDetector::_update_topics();
 
-	_orb_update(ORB_ID(airspeed), _airspeedSub, &_airspeed);
+	_airspeed_sub.update(&_airspeed);
+	_vehicle_status_sub.update(&_vehicle_status);
+}
+
+bool VtolLandDetector::_get_maybe_landed_state()
+{
+	// Only trigger in RW mode
+	if ((_vehicle_status.timestamp != 0) && _vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) {
+		return false;
+	}
+
+	return MulticopterLandDetector::_get_maybe_landed_state();
 }
 
 bool VtolLandDetector::_get_landed_state()
 {
+	// Only trigger in RW mode
+	if ((_vehicle_status.timestamp != 0) && _vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) {
+		return false;
+	}
+
 	// this is returned from the mutlicopter land detector
 	bool landed = MulticopterLandDetector::_get_landed_state();
 
 	// for vtol we additionally consider airspeed
-	if (hrt_elapsed_time(&_airspeed.timestamp) < 500 * 1000) {
-		_airspeed_filtered = 0.95f * _airspeed_filtered + 0.05f * _airspeed.true_airspeed_m_s;
+	if (hrt_elapsed_time(&_airspeed.timestamp) < 500 * 1000 && _airspeed.confidence > 0.99f
+	    && PX4_ISFINITE(_airspeed.indicated_airspeed_m_s)) {
+
+		_airspeed_filtered = 0.95f * _airspeed_filtered + 0.05f * _airspeed.indicated_airspeed_m_s;
 
 	} else {
 		// if airspeed does not update, set it to zero and rely on multicopter land detector
@@ -87,18 +92,13 @@ bool VtolLandDetector::_get_landed_state()
 
 	// only consider airspeed if we have been in air before to avoid false
 	// detections in the case of wind on the ground
-	if (_was_in_air && _airspeed_filtered > _params.maxAirSpeed) {
+	if (_was_in_air && (_airspeed_filtered > _params.maxAirSpeed)) {
 		landed = false;
 	}
 
 	_was_in_air = !landed;
 
 	return landed;
-}
-
-bool VtolLandDetector::_get_freefall_state()
-{
-	return MulticopterLandDetector::_get_freefall_state();
 }
 
 void VtolLandDetector::_update_params()
@@ -108,4 +108,4 @@ void VtolLandDetector::_update_params()
 	param_get(_paramHandle.maxAirSpeed, &_params.maxAirSpeed);
 }
 
-}
+} // namespace land_detector

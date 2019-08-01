@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2012-2015 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2012-2017 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -32,16 +32,13 @@
  ****************************************************************************/
 
 /**
- * @file Publication.h
+ * @file Publication.hpp
  *
  */
 
 #pragma once
 
-#include <assert.h>
-
 #include <uORB/uORB.h>
-#include <containers/List.hpp>
 #include <systemlib/err.h>
 
 namespace uORB
@@ -51,7 +48,8 @@ namespace uORB
  * Base publication wrapper class, used in list traversal
  * of various publications.
  */
-class __EXPORT PublicationBase
+template<typename T>
+class Publication
 {
 public:
 
@@ -63,49 +61,61 @@ public:
 	 * @param priority The priority for multi pub/sub, 0-based, -1 means
 	 * 	don't publish as multi
 	 */
-	PublicationBase(const struct orb_metadata *meta,
-			int priority = -1);
+	Publication(const orb_metadata *meta, int priority = -1) : _meta(meta), _priority(priority) {}
+
+	~Publication() { orb_unadvertise(_handle); }
 
 	/**
-	 * Update the struct
+	 * Publish the struct
 	 * @param data The uORB message struct we are updating.
 	 */
-	void update(void *data);
+	bool publish(const T &data)
+	{
+		bool updated = false;
 
-	/**
-	 * Deconstructor
-	 */
-	virtual ~PublicationBase();
+		if (_handle != nullptr) {
+			if (orb_publish(_meta, _handle, &data) != PX4_OK) {
+				PX4_ERR("%s publish fail", _meta->o_name);
 
-// accessors
-	const struct orb_metadata *getMeta() { return _meta; }
-	orb_advert_t getHandle() { return _handle; }
+			} else {
+				updated = true;
+			}
+
+		} else {
+			orb_advert_t handle = nullptr;
+
+			if (_priority > 0) {
+				int instance;
+				handle = orb_advertise_multi(_meta, &data, &instance, _priority);
+
+			} else {
+				handle = orb_advertise(_meta, &data);
+			}
+
+			if (handle != nullptr) {
+				_handle = handle;
+				updated = true;
+
+			} else {
+				PX4_ERR("%s advert fail", _meta->o_name);
+			}
+		}
+
+		return updated;
+	}
+
 protected:
-	// disallow copy
-	PublicationBase(const PublicationBase &other);
-	// disallow assignment
-	PublicationBase &operator=(const PublicationBase &other);
-// accessors
-	void setHandle(orb_advert_t handle) { _handle = handle; }
-// attributes
-	const struct orb_metadata *_meta;
-	int _priority;
-	int _instance;
-	orb_advert_t _handle;
-};
+	const orb_metadata *_meta;
+	const int _priority;
 
-/**
- * alias class name so it is clear that the base class
- * can be used by itself if desired
- */
-typedef PublicationBase PublicationTiny;
+	orb_advert_t _handle{nullptr};
+};
 
 /**
  * The publication base class as a list node.
  */
-class __EXPORT PublicationNode :
-	public PublicationBase,
-	public ListNode<PublicationNode *>
+template<typename T>
+class PublicationData : public Publication<T>
 {
 public:
 	/**
@@ -114,64 +124,23 @@ public:
 	 * @param meta The uORB metadata (usually from
 	 * 	the ORB_ID() macro) for the topic.
 	 * @param priority The priority for multi pub, 0-based.
-	 * @param list A list interface for adding to
-	 * 	list during construction
 	 */
-	PublicationNode(const struct orb_metadata *meta,
-			int priority = -1,
-			List<PublicationNode *> *list = nullptr);
+	PublicationData(const orb_metadata *meta, int priority = -1) : Publication<T>(meta, priority) {}
+	~PublicationData() = default;
 
-	/**
-	 * This function is the callback for list traversal
-	 * updates, a child class must implement it.
-	 */
-	virtual void update() = 0;
-};
+	T	&get() { return _data; }
+	void	set(const T &data) { _data = data; }
 
-/**
- * Publication wrapper class
- */
-template<class T>
-class __EXPORT Publication :
-	public PublicationNode
-{
-public:
-	/**
-	 * Constructor
-	 *
-	 * @param meta The uORB metadata (usually from
-	 * 	the ORB_ID() macro) for the topic.
-	 * @param priority The priority for multi pub, 0-based.
-	 * @param list A list interface for adding to
-	 * 	list during construction
-	 */
-	Publication(const struct orb_metadata *meta,
-		    int priority = -1,
-		    List<PublicationNode *> *list = nullptr)  :
-		PublicationNode(meta, priority, list),
-		_data()
+	// Publishes the embedded struct.
+	bool	update() { return Publication<T>::publish(_data); }
+	bool	update(const T &data)
 	{
+		_data = data;
+		return Publication<T>::publish(_data);
 	}
 
-	/**
-	 * Deconstructor
-	 **/
-	virtual ~Publication() {};
-
-	/*
-	 * This function gets the T struct
-	 * */
-	T &get() { return _data; }
-
-	/**
-	 * Create an update function that uses the embedded struct.
-	 */
-	void update()
-	{
-		PublicationBase::update((void *)(&_data));
-	}
 private:
-	T _data;
+	T _data{};
 };
 
 } // namespace uORB

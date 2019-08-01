@@ -39,44 +39,18 @@
 
 #include "rc_update.h"
 
-#include <uORB/uORB.h>
 #include <uORB/topics/actuator_controls.h>
 #include <uORB/topics/manual_control_setpoint.h>
-
-#include <string.h>
-#include <errno.h>
 
 using namespace sensors;
 
 RCUpdate::RCUpdate(const Parameters &parameters)
-	: _parameters(parameters)
+	: _parameters(parameters),
+	  _filter_roll(50.0f, 10.f), /* get replaced by parameter */
+	  _filter_pitch(50.0f, 10.f),
+	  _filter_yaw(50.0f, 10.f),
+	  _filter_throttle(50.0f, 10.f)
 {
-	memset(&_rc, 0, sizeof(_rc));
-	memset(&_rc_parameter_map, 0, sizeof(_rc_parameter_map));
-	memset(&_param_rc_values, 0, sizeof(_param_rc_values));
-}
-
-int RCUpdate::init()
-{
-	_rc_sub = orb_subscribe(ORB_ID(input_rc));
-
-	if (_rc_sub < 0) {
-		return -errno;
-	}
-
-	_rc_parameter_map_sub = orb_subscribe(ORB_ID(rc_parameter_map));
-
-	if (_rc_parameter_map_sub < 0) {
-		return -errno;
-	}
-
-	return 0;
-}
-
-void RCUpdate::deinit()
-{
-	orb_unsubscribe(_rc_sub);
-	orb_unsubscribe(_rc_parameter_map_sub);
 }
 
 void RCUpdate::update_rc_functions()
@@ -95,8 +69,11 @@ void RCUpdate::update_rc_functions()
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_ACRO] = _parameters.rc_map_acro_sw - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_OFFBOARD] = _parameters.rc_map_offboard_sw - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_KILLSWITCH] = _parameters.rc_map_kill_sw - 1;
+	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_ARMSWITCH] = _parameters.rc_map_arm_sw - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_TRANSITION] = _parameters.rc_map_trans_sw - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_GEAR] = _parameters.rc_map_gear_sw - 1;
+	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_STAB] = _parameters.rc_map_stab_sw - 1;
+	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_MAN] = _parameters.rc_map_man_sw - 1;
 
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_FLAPS] = _parameters.rc_map_flaps - 1;
 
@@ -105,20 +82,28 @@ void RCUpdate::update_rc_functions()
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_AUX_3] = _parameters.rc_map_aux3 - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_AUX_4] = _parameters.rc_map_aux4 - 1;
 	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_AUX_5] = _parameters.rc_map_aux5 - 1;
+	_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_AUX_6] = _parameters.rc_map_aux6 - 1;
 
 	for (int i = 0; i < rc_parameter_map_s::RC_PARAM_MAP_NCHAN; i++) {
 		_rc.function[rc_channels_s::RC_CHANNELS_FUNCTION_PARAM_1 + i] = _parameters.rc_map_param[i] - 1;
 	}
+
+	/* update the RC low pass filter frequencies */
+	_filter_roll.set_cutoff_frequency(_parameters.rc_flt_smp_rate, _parameters.rc_flt_cutoff);
+	_filter_pitch.set_cutoff_frequency(_parameters.rc_flt_smp_rate, _parameters.rc_flt_cutoff);
+	_filter_yaw.set_cutoff_frequency(_parameters.rc_flt_smp_rate, _parameters.rc_flt_cutoff);
+	_filter_throttle.set_cutoff_frequency(_parameters.rc_flt_smp_rate, _parameters.rc_flt_cutoff);
+	_filter_roll.reset(0.f);
+	_filter_pitch.reset(0.f);
+	_filter_yaw.reset(0.f);
+	_filter_throttle.reset(0.f);
 }
 
 void
 RCUpdate::rc_parameter_map_poll(ParameterHandles &parameter_handles, bool forced)
 {
-	bool map_updated;
-	orb_check(_rc_parameter_map_sub, &map_updated);
-
-	if (map_updated) {
-		orb_copy(ORB_ID(rc_parameter_map), _rc_parameter_map_sub, &_rc_parameter_map);
+	if (_rc_parameter_map_sub.updated()) {
+		_rc_parameter_map_sub.copy(&_rc_parameter_map);
 
 		/* update parameter handles to which the RC channels are mapped */
 		for (int i = 0; i < rc_parameter_map_s::RC_PARAM_MAP_NCHAN; i++) {
@@ -159,16 +144,7 @@ RCUpdate::get_rc_value(uint8_t func, float min_value, float max_value)
 {
 	if (_rc.function[func] >= 0) {
 		float value = _rc.channels[_rc.function[func]];
-
-		if (value < min_value) {
-			return min_value;
-
-		} else if (value > max_value) {
-			return max_value;
-
-		} else {
-			return value;
-		}
+		return math::constrain(value, min_value, max_value);
 
 	} else {
 		return 0.0f;
@@ -242,14 +218,10 @@ RCUpdate::set_params_from_rc(const ParameterHandles &parameter_handles)
 void
 RCUpdate::rc_poll(const ParameterHandles &parameter_handles)
 {
-	bool rc_updated;
-	orb_check(_rc_sub, &rc_updated);
-
-	if (rc_updated) {
+	if (_rc_sub.updated()) {
 		/* read low-level values from FMU or IO RC inputs (PPM, Spektrum, S.Bus) */
-		struct rc_input_values rc_input;
-
-		orb_copy(ORB_ID(input_rc), _rc_sub, &rc_input);
+		input_rc_s rc_input{};
+		_rc_sub.copy(&rc_input);
 
 		/* detect RC signal loss */
 		bool signal_lost;
@@ -347,8 +319,8 @@ RCUpdate::rc_poll(const ParameterHandles &parameter_handles)
 		int instance;
 		orb_publish_auto(ORB_ID(rc_channels), &_rc_pub, &_rc, &instance, ORB_PRIO_DEFAULT);
 
-		/* only publish manual control if the signal is still present */
-		if (!signal_lost) {
+		/* only publish manual control if the signal is still present and was present once */
+		if (!signal_lost && rc_input.timestamp_last_signal > 0) {
 
 			/* initialize manual setpoint */
 			struct manual_control_setpoint_s manual = {};
@@ -356,6 +328,7 @@ RCUpdate::rc_poll(const ParameterHandles &parameter_handles)
 			manual.mode_slot = manual_control_setpoint_s::MODE_SLOT_NONE;
 			/* set the timestamp to the last signal time */
 			manual.timestamp = rc_input.timestamp_last_signal;
+			manual.data_source = manual_control_setpoint_s::SOURCE_RC;
 
 			/* limit controls */
 			manual.y = get_rc_value(rc_channels_s::RC_CHANNELS_FUNCTION_ROLL, -1.0, 1.0);
@@ -368,6 +341,13 @@ RCUpdate::rc_poll(const ParameterHandles &parameter_handles)
 			manual.aux3 = get_rc_value(rc_channels_s::RC_CHANNELS_FUNCTION_AUX_3, -1.0, 1.0);
 			manual.aux4 = get_rc_value(rc_channels_s::RC_CHANNELS_FUNCTION_AUX_4, -1.0, 1.0);
 			manual.aux5 = get_rc_value(rc_channels_s::RC_CHANNELS_FUNCTION_AUX_5, -1.0, 1.0);
+			manual.aux6 = get_rc_value(rc_channels_s::RC_CHANNELS_FUNCTION_AUX_6, -1.0, 1.0);
+
+			/* filter controls */
+			manual.y = math::constrain(_filter_roll.apply(manual.y), -1.f, 1.f);
+			manual.x = math::constrain(_filter_pitch.apply(manual.x), -1.f, 1.f);
+			manual.r = math::constrain(_filter_yaw.apply(manual.r), -1.f, 1.f);
+			manual.z = math::constrain(_filter_throttle.apply(manual.z), 0.f, 1.f);
 
 			if (_parameters.rc_map_flightmode > 0) {
 
@@ -414,14 +394,20 @@ RCUpdate::rc_poll(const ParameterHandles &parameter_handles)
 						 _parameters.rc_offboard_th, _parameters.rc_offboard_inv);
 			manual.kill_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_KILLSWITCH,
 					     _parameters.rc_killswitch_th, _parameters.rc_killswitch_inv);
+			manual.arm_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_ARMSWITCH,
+					    _parameters.rc_armswitch_th, _parameters.rc_armswitch_inv);
 			manual.transition_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_TRANSITION,
 						   _parameters.rc_trans_th, _parameters.rc_trans_inv);
 			manual.gear_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_GEAR,
 					     _parameters.rc_gear_th, _parameters.rc_gear_inv);
+			manual.stab_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_STAB,
+					     _parameters.rc_stab_th, _parameters.rc_stab_inv);
+			manual.man_switch = get_rc_sw2pos_position(rc_channels_s::RC_CHANNELS_FUNCTION_MAN,
+					    _parameters.rc_man_th, _parameters.rc_man_inv);
 
 			/* publish manual_control_setpoint topic */
 			orb_publish_auto(ORB_ID(manual_control_setpoint), &_manual_control_pub, &manual, &instance,
-					 ORB_PRIO_DEFAULT);
+					 ORB_PRIO_HIGH);
 
 			/* copy from mapped manual control to control group 3 */
 			struct actuator_controls_s actuator_group_3 = {};
